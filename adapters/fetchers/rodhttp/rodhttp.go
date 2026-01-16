@@ -4,6 +4,7 @@ package rodhttp
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gosom/scrapemate"
 	rodadapter "github.com/gosom/scrapemate/adapters/browsers/rod"
+	jshttp "github.com/gosom/scrapemate/adapters/fetchers/jshttp"
 )
 
 var _ scrapemate.HTTPFetcher = (*rodFetch)(nil)
@@ -87,6 +89,7 @@ type rodFetch struct {
 	browserReuseLimit int
 	ua                string
 	stealth           bool
+	authProxies       []*jshttp.AuthProxy  // Track local auth proxies for cleanup
 }
 
 func (o *rodFetch) getBrowser(ctx context.Context) (*browser, error) {
@@ -116,8 +119,14 @@ func (o *rodFetch) putBrowser(ctx context.Context, b *browser) {
 	}
 }
 
-// Close closes all browsers in the pool.
+// Close closes all browsers in the pool and cleanup auth proxies.
 func (o *rodFetch) Close() error {
+	// Cleanup auth proxies
+	for _, ap := range o.authProxies {
+		_ = ap.Close()
+	}
+	o.authProxies = nil
+
 	close(o.pool)
 
 	for b := range o.pool {
@@ -232,7 +241,26 @@ func (o *rodFetch) newBrowser() (*browser, error) {
 			// TODO: Implement proxy rotation per browser
 			proxy := o.rotator.Next()
 
-			l = l.Proxy(proxy.FullURL())
+			// Check if proxy has authentication
+			// Chromium doesn't support embedded credentials in proxy URL
+			// so we use a local proxy pattern for authenticated proxies
+			if proxy.Username != "" && proxy.Password != "" {
+				// Create local proxy that handles authentication upstream
+				authProxy, err := jshttp.StartAuthProxy(
+					proxy.FullURL(),
+					proxy.Username,
+					proxy.Password,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to start auth proxy: %w", err)
+				}
+				// Store for cleanup and use local address (no auth needed by browser)
+				o.authProxies = append(o.authProxies, authProxy)
+				l = l.Proxy(authProxy.Address())
+			} else {
+				// No auth, use proxy directly
+				l = l.Proxy(proxy.FullURL())
+			}
 		}
 	}
 
